@@ -1,0 +1,676 @@
+---
+title: "Stats & Data Science II - Assignment"
+output: 
+  html_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+```
+
+# Problem description
+
+In our cities, there are some services that are essential for our daily living: pharmacies, schools or transport points of sale. However, these facilities are not necessarily well distributed. We want to analyze in this assignment which areas lacks of these facilities based on regression models. The steps to perform the analysis are:
+
+- EDA: Descriptive analysis of data
+- Feature selection: Are there variables we can discard?
+- Perform a feature engineering process extending important variables
+- Perform regression modelling for the three target variables (three different models).
+- Create a score to measure which areas have enough facilities and which ones don't.
+- Which variables are the most highly related to the score? In particular, what makes a census section to have a low number of facilities?
+- Discuss the results
+<br><br>
+
+# Dataset description
+
+```{r}
+df<-fread("census_section_stats.csv", sep=";", dec=",", stringsAsFactors = F)
+```
+
+For every census section we have a row in our dataset, here are some of the main columns of the dataset:
+
+* census_section_code: census_section_code identifier
+* n_pharmacies (target variable 1): number of pharmacies in the census section
+* n_schools (target variable 2): number of schools in the census section
+* n_transport_salespoints (target variable 3): number of transport points of sale.
+<br><br>
+
+# Libraries
+
+```{r}
+library(DataExplorer)
+library(corrplot)
+library(glmnet)
+library(MASS)
+library(pscl)
+library(pROC)
+library(caret)
+library(tidyverse)
+```
+<br><br>
+
+# Descriptive analysis
+
+## Pre-processing
+
+```{r}
+df <- as_tibble(df)
+
+summary(df)
+```
+
+Each observation (row) is a different census section with its unique `census_section_code` as identifier. This code also carries information about the province, city and district (although they are also stored in other variables).
+
+Then most of the variables present in the dataset are some characteristics of this section (such as population, area. income, age composition, ethnic composition), while some variables are coded at a city level (population). Lastly, we have our target variables.
+
+None of the variables take negative values. The majority of the variables represent percentages.
+<br><br><br>
+
+```{r}
+# We don't have any NA
+any(is.na.data.frame(df))
+
+# Dropping pcg_foreigners which is the same variable as foreigners
+cor(df$pcg_foreigners, df$foreigners)
+# Dropping province code as the variable takes only one value 
+unique(df$province_code)
+# Dropping index which is just the row number
+# Dropping geometry which is a variable that carries no information for our regressions
+df <- df |>
+  select(-province_code, -index, -pcg_foreigners, -geometry)
+
+# Extracting geographic info from centroid
+df <- df |> 
+  mutate(centroid = gsub("POINT \\(|\\)", "", centroid)) |>  
+  separate_wider_delim(centroid, names = c("x_coord", "y_coord"), delim = " ")
+```
+
+I drop unnecessary variables and transform `centroid` to try to use the information it carries.
+<br><br><br>
+
+```{r}
+str(df)
+
+# Converting to numeric
+df <- df |> 
+  mutate(across(everything(), as.numeric))
+
+plot_histogram(df[names(df)])
+```
+
+From the histograms we can see that most of the variables are not normally distributed. Most of them (especially the percentages) are right skewed and for many of them, 0 or values close to 0 are the most present values.
+<br><br><br>
+
+## Independent variables
+
+```{r, layout="l-body-outset", fig.height=6, dpi=500}
+# Exploring multicollinearity of independent variables
+corrplot(cor(df |> select(- n_pharmacies, - n_schools, - n_transport_salespoints)), type = "upper", method = "circle", tl.cex = 0.5, tl.col = "black", order = "FPC")
+```
+
+From this first graph we cannot understand much due to the high number of variables present. However, we can already see that there are cases of highly correlated variables. For example, `spanish` is highly correlated with other variables storing other ethnic compositions.
+<br><br><br>
+
+```{r, layout="l-body-outset", fig.height=5, dpi=500}
+corr_simple <- function(data=df,sig=0.5){
+  #run a correlation and drop the insignificant ones
+  corr <- cor(df)
+  #prepare to drop duplicates and correlations of 1     
+  corr[lower.tri(corr,diag=TRUE)] <- NA 
+  #turn into a 3-column table
+  corr <- as.data.frame(as.table(corr))
+  #remove the NA values from above 
+  corr <- na.omit(corr)
+  #rename Freq to Correlation
+  names(corr)[names(corr) == "Freq"] <- "Correlation"
+  #select significant values  
+  corr <- subset(corr, abs(Correlation) > sig) 
+  #sort by highest correlation
+  corr <- corr[order(-abs(corr$Correlation)),] 
+  #print values above 0.9
+  print(corr[abs(corr$Correlation) > 0.9, ])
+  #turn corr back into matrix in order to plot with corrplot
+  mtx_corr <- reshape2::acast(corr, Var1~Var2, value.var="Correlation")
+  #plot correlations visually
+  corrplot(mtx_corr, is.corr=FALSE, tl.col="black", na.label=" ", tl.cex = 0.7)
+}
+corr_simple(df |> select(- n_pharmacies, - n_schools, - n_transport_salespoints))
+```
+
+Using a function I have found on the internet, I extract only the strongest correlation to have a closer look at them (plotted are the ones above |0.5| and printed are the ones above |0.9|). We see that some of our explanatory variables are highly correlated among each other.  
+
+The location codes are highly correlated among each other as the information of the larger geographical level is included in the lower geographical level. `family_income` is highly correlated with `income_per_capita` as conceivable. The ethnic composition percentages are highly correlated among themselves as they are indeed percentages of the same whole. The same happens for the percentage of different age groups,
+<br><br><br>
+
+```{r}
+summary(lm(spanish ~ foreigners, data = df))
+summary(lm(foreigners ~ europeans + non_european + african + american + asian + oceanic, data = df))
+summary(lm(europeans ~ germans + bulgarian + french + italian + polish + portuguese + british + romanian, data = df))
+summary(lm(pcg_age_0_24 ~ pcg_age_25_39 + pcg_age_40_49 + pcg_age_50_59 + pcg_age_60_69 + pcg_age_70_y_mas, data = df))
+# Other variables which are composite
+# summary(lm(non_european ~ russian + ukranian, data = df))
+# summary(lm(african ~ algerian + moroccan + nigerian + senegalese, data = df))
+# summary(lm(american ~ argentinian + bolivian + brazilian + colombian + cuban + chilean + ecuadorian + paraguayan + peruvian + uruguayan + venezuelan + dominican, data = df))
+# summary(lm(asian ~ chininese + pakistani, data = df))
+# summary(lm(avg_age ~ pcg_age_0_24 + pcg_age_25_39 + pcg_age_40_49 + pcg_age_50_59 + pcg_age_60_69 + pcg_age_70_y_mas, data = df))
+```
+
+Since I suspected that some of the explanatory variables are composite of other independent variables I run some regression to confirm my hypothesis. I found that many of my explanatory variables are indeed a linear combination of other variables (we can see it from the R-squared equal or very very close to 1). `foreigners` for example is equal to 1-`spanish` and the same happens for other ethnic composition variables such as `europeans`, `americans` etc. as well as the percentages of age groups.
+
+As our model is a predictive and not an explanatory model, we are more focused on the performance of our model, rather than the interpretation of the coefficients. Therefore, we keep all the composite and the highly multicollinear variables without removing any of them. However in the case that we were interested in interpreting the coefficients we would have to carefully remove some of the layers of our variables.
+<br><br><br>
+
+## Dependent variables
+
+```{r}
+# Exploring our dependent variables
+ggplot(df, aes(x=n_pharmacies)) + 
+  geom_histogram()
+ggplot(df, aes(x=n_schools)) + 
+  geom_histogram()
+ggplot(df, aes(x=n_transport_salespoints)) + 
+  geom_histogram()
+```
+
+Our dependent variables only take non-negatve, integer values therefore suggesting that they could be following a Poisson distribution and that Poisson regression or its variations could be a good idea for our regression models. It is also worth nothing that all our dependent variables have a high number of zeros.
+<br><br><br>
+
+```{r}
+var(df$n_pharmacies)/mean(df$n_pharmacies)
+var(df$n_schools)/mean(df$n_schools)
+var(df$n_transport_salespoints)/mean(df$n_transport_salespoints)
+```
+
+Since we suspect our dependent variables are Poisson distributed we check whether their variance actually equals their mean (equidispersion assumption). The only dependent variable for which there seems to be a more significant difference is `n_schhols`
+<br><br><br>
+
+```{r, layout="l-body-outset", fig.width=10, dpi=300}
+# Looking at correlation between dependent and independent variables
+cor_matrix <- cor(df[, !names(df) %in% c("n_pharmacies", "n_schools", "n_transport_salespoints")],
+                  df[, c("n_pharmacies", "n_schools", "n_transport_salespoints")])
+cor_matrix <- t(cor_matrix)
+corrplot(cor_matrix, method = "circle", tl.cex = 0.7, tl.col = "black")
+
+# Using spearman instead of pearson which is better when there are non-linear relationship
+cor_matrix <- cor(df[, !names(df) %in% c("n_pharmacies", "n_schools", "n_transport_salespoints")],
+                  df[, c("n_pharmacies", "n_schools", "n_transport_salespoints")],
+                  method = "spearman")
+cor_matrix <- t(cor_matrix)
+corrplot(cor_matrix, method = "circle", tl.cex = 0.7, tl.col = "black")
+```
+
+Not many explanatory variables seem to be highly correlated with the dependent variables suggesting that the relationship between the dependent variables and independent variables might be non-linear and further strengthening the idea of using a poisson regression model.
+
+Since Spearman correlation seems sometimes stronger than Pearson this suggests that some of the relationship between explanatory variables and dependent variables might be better captured by a monotonic, but non-linear relationship. 
+<br><br>
+
+# Feature engineering
+
+```{r}
+excluded_vars <- c("n_pharmacies", "n_schools", "n_transport_salespoints")
+
+data <- df %>%
+  mutate(across(
+    .cols = setdiff(names(df), excluded_vars),
+    .fns = list(
+      square = ~ .^2,
+      cube = ~ .^3,
+      sqrt = ~ sqrt(.))))
+```
+
+I am transforming our explanatory variables using the square root because many of them present right-skewness and taking the squared root helps tackle this by "compressing" higher values and "stretching" lower values. I chose this over the log transformation because the squared root is able to handle 0s.
+
+I also add squared and cubic transformation so as to model eventual non-linear relationship.
+<br><br>
+
+# Feature selection
+
+We will do feature selection through a Poisson Lasso regularization with 5-fold cross validation over the whole datastet for hyperparameter tuning. From these I will extract all features that are not zero and use them afterwards to train different regression models. 
+
+```{r}
+# Separate target and explanatory variables and pipe them as matrix objects
+X <- data |> select(- n_pharmacies, - n_schools, - n_transport_salespoints) |> as.matrix()
+Y_pharmacies <- data |> select(n_pharmacies) |> as.matrix()
+Y_schools <- data |> select(n_schools) |> as.matrix()
+Y_transport <- data |> select(n_transport_salespoints) |> as.matrix()
+```
+
+```{r}
+set.seed(123)
+
+# Applying regularization 
+shrinkage_pharmacies <- cv.glmnet(
+  x = X, y = Y_pharmacies, 
+  lambda = NULL, alpha = 1,
+  type.measure = "mse",
+  standardize = TRUE,
+  nfolds = 10, 
+  family = "poisson")
+```
+
+Lambda sequence is computed by cv.glmnet itself (`lambda = NULL`). `alpha = 1` implies we are doing a Lasso regularization (we have a lot of variables and we are interested in reducing their number). `type.measure = "mse"` means that I am evaluating best lambda based on mean squared error.
+<br><br><br>
+
+```{r}
+# Extract the coefficients at the best lambda
+coefficients <- coef(shrinkage_pharmacies, s = shrinkage_pharmacies$lambda.min)
+
+# Identify non-zero coefficients
+non_zero_features <- rownames(coefficients)[which(coefficients != 0)]
+
+# Remove the intercept from the list of features
+non_zero_features <- non_zero_features[non_zero_features != "(Intercept)"]
+
+# Select all those features for future regression
+pharmacies <- data |> 
+  select(all_of(non_zero_features), n_pharmacies)
+
+str(pharmacies)
+```
+
+```{r}
+# Repeat the same for the other dependent variables
+
+# Schools
+set.seed(123)
+shrinkage_schools <- cv.glmnet(
+  x = X, y = Y_schools, 
+  lambda = NULL, alpha = 1,
+  type.measure="mse",
+  standardize = TRUE,
+  nfolds = 10, 
+  family = "poisson")
+coefficients <- coef(shrinkage_schools, s = shrinkage_schools$lambda.min)
+non_zero_features <- rownames(coefficients)[which(coefficients != 0)]
+non_zero_features <- non_zero_features[non_zero_features != "(Intercept)"]
+schools <- data |> 
+  select(all_of(non_zero_features), n_schools)
+str(schools)
+
+# Transport
+set.seed(123)
+shrinkage_transport <- cv.glmnet(
+  x = X, y = Y_transport, 
+  lambda = NULL, alpha = 1,
+  type.measure="mse",
+  standardize = TRUE,
+  nfolds = 10, 
+  family = "poisson")
+coefficients <- coef(shrinkage_transport, s = shrinkage_transport$lambda.min)
+non_zero_features <- rownames(coefficients)[which(coefficients != 0)]
+non_zero_features <- non_zero_features[non_zero_features != "(Intercept)"]
+transport <- data |> 
+  select(all_of(non_zero_features), n_transport_salespoints)
+str(transport)
+```
+
+Transport, compared to the other dependent variables, has a relatively low number of relevant features. This might be because it is the target variable with the least variation and hence we might have difficulties in building a linear model for it.
+<br><br>
+
+# Regression models
+
+As our dependent variables are non-negative count data we will fit several models. We will fit a linear model, although as a baseline and then try to fit Poisson regression and its variations to see whether they improve the model performance or not.
+
+Since `n_schools` had a variance double its mean we will fit QuasiPoisson and Negative Binomial Regression to take into account potential overdispersion. Furthermore, given that all of the target variables (especially `n_transport_salespoints`) had a high number of zeros, we will fit also a zero-inflated poisson and a zero-inflated negative binomial.  Unfortunately we are not able to run cross validation for selecting the best parameters for our model (as some of this model are not supported by `caret`), so each model will be trained only once on the whole training dataframe. We will evaluate all these model on the test dataset using MAE, RMSE and R2, as well as looking at their AIC.
+
+```{r}
+set.seed(1234)
+
+# Splitting data 
+training_samples <- data$n_pharmacies |>  
+  createDataPartition(p = 0.8, list = FALSE)
+
+# Creating different datasets for all dependent variables
+train_pharmacies  <- pharmacies[training_samples, ]
+test_pharmacies <- pharmacies[-training_samples, ]
+
+train_schools  <- schools[training_samples, ]
+test_schools <- schools[-training_samples, ]
+
+train_transport  <- transport[training_samples, ]
+test_transport <- transport[-training_samples, ]
+```
+<br><br>
+
+## Pharmacies
+
+```{r}
+set.seed(12345)
+
+# Linear model
+lm_pharmacies <- lm(n_pharmacies ~ ., data = train_pharmacies)
+
+# Poisson model
+poisson_pharmacies <- glm(n_pharmacies ~ ., data = train_pharmacies, family = "poisson")
+
+# Quasi-Poisson model
+qpois_pharmacies <- glm(n_pharmacies ~ ., data = train_pharmacies, family = "quasipoisson")
+
+# Negative Binomial model
+negbin_pharmacies <- glm.nb(n_pharmacies ~ ., data = train_pharmacies)
+
+# Zero-Inflated Poisson model
+zip_pharmacies <- zeroinfl(n_pharmacies ~ ., data = train_pharmacies, dist="poisson", link = "logit")
+
+# Zero-Inflated Negative Binomial model
+zinb_pharmacies <- zeroinfl(n_pharmacies ~ ., data = train_pharmacies, dist="negbin", link = "logit")
+```
+
+```{r}
+list(linear = AIC(lm_pharmacies),
+     poisson = AIC(poisson_pharmacies),
+     quasi_poisson = AIC(qpois_pharmacies),
+     negative_binomial = AIC(negbin_pharmacies),
+     zero_inflated_poisson = AIC(zip_pharmacies),
+     zero_inflated_negativebinomial = AIC(zinb_pharmacies))
+```
+
+AIC unfortunately cannot be calculated for the quasi-poisson. However in the trainig data, the model with the best AIC seems to be the Poisson.
+<br><br><br>
+
+```{r}
+test_pharmacies <- test_pharmacies |> 
+  mutate(
+    pred_lm = predict(lm_pharmacies, test_pharmacies, type = "response"),
+    pred_poisson = predict(poisson_pharmacies, test_pharmacies, type = "response"),
+    pred_quasip = predict(qpois_pharmacies, test_pharmacies, type = "response"),
+    pred_negbin = predict(negbin_pharmacies, test_pharmacies, type = "response"),
+    pred_zip = predict(zip_pharmacies, test_pharmacies, type = "response"),
+    pred_zinb = predict(zinb_pharmacies, test_pharmacies, type = "response")
+)
+
+data.frame(
+  model = c("linear", "poisson", "quasi-poisson", "negative-binomial", "zero-inflated-poisson", "zero-inflated-negative-binomial"),
+  MAE = c(MAE(test_pharmacies$n_pharmacies, test_pharmacies$pred_lm),
+          MAE(test_pharmacies$n_pharmacies, test_pharmacies$pred_poisson),
+          MAE(test_pharmacies$n_pharmacies, test_pharmacies$pred_quasip),
+          MAE(test_pharmacies$n_pharmacies, test_pharmacies$pred_negbin),
+          MAE(test_pharmacies$n_pharmacies, test_pharmacies$pred_zip),
+          MAE(test_pharmacies$n_pharmacies, test_pharmacies$pred_zinb)),
+    RMSE = c(RMSE(test_pharmacies$n_pharmacies, test_pharmacies$pred_lm),
+          RMSE(test_pharmacies$n_pharmacies, test_pharmacies$pred_poisson),
+          RMSE(test_pharmacies$n_pharmacies, test_pharmacies$pred_quasip),
+          RMSE(test_pharmacies$n_pharmacies, test_pharmacies$pred_negbin),
+          RMSE(test_pharmacies$n_pharmacies, test_pharmacies$pred_zip),
+          RMSE(test_pharmacies$n_pharmacies, test_pharmacies$pred_zinb)),
+    R2 = c(R2(test_pharmacies$n_pharmacies, test_pharmacies$pred_lm),
+          R2(test_pharmacies$n_pharmacies, test_pharmacies$pred_poisson),
+          R2(test_pharmacies$n_pharmacies, test_pharmacies$pred_quasip),
+          R2(test_pharmacies$n_pharmacies, test_pharmacies$pred_negbin),
+          R2(test_pharmacies$n_pharmacies, test_pharmacies$pred_zip),
+          R2(test_pharmacies$n_pharmacies, test_pharmacies$pred_zinb)))
+```
+
+Linear model seems to be the best one across all performance scores.
+<br><br>
+
+## Schools
+
+```{r}
+set.seed(12345)
+
+# Linear model 
+lm_schools <- lm(n_schools ~ ., data = train_schools)
+
+# Poisson model 
+poisson_schools <- glm(n_schools ~ ., data = train_schools, family = "poisson")
+
+# Quasi-Poisson model 
+qpois_schools <- glm(n_schools ~ ., data = train_schools, family = "quasipoisson")
+
+# Negative Binomial model
+negbin_schools <- glm.nb(n_schools ~ ., data = train_schools)
+
+# Zero-Inflated Poisson model
+zip_schools <- zeroinfl(n_schools ~ ., data = train_schools, dist="poisson", link = "logit")
+
+# Zero-Inflated Negative Binomial model
+zinb_schools <- zeroinfl(n_schools ~ ., data = train_schools, dist="negbin", link = "logit")
+```
+
+```{r}
+list(linear = AIC(lm_schools),
+     poisson = AIC(poisson_schools),
+     quasi_poisson = AIC(qpois_schools),
+     negative_binomial = AIC(negbin_schools),
+     zero_inflated_poisson = AIC(zip_schools),
+     zero_inflated_negativebinomial = AIC(zinb_schools))
+```
+
+The model with the best AIC in the training data is the negative binomial.
+<br><br><br>
+
+```{r}
+test_schools <- test_schools |> 
+  mutate(
+    pred_lm = predict(lm_schools, test_schools, type = "response"),
+    pred_poisson = predict(poisson_schools, test_schools, type = "response"),
+    pred_quasip = predict(qpois_schools, test_schools, type = "response"),
+    pred_negbin = predict(negbin_schools, test_schools, type= "response"),
+    pred_zip = predict(zip_schools, test_schools, type = "response"),
+    pred_zinb = predict(zinb_schools, test_schools, type = "response")
+)
+
+data.frame(
+  model = c("linear", "poisson", "quasi-poisson", "negative-binomial", "zero-inflated-poisson", "zero-inflated-negative-binomial"),
+  MAE = c(MAE(test_schools$n_schools, test_schools$pred_lm),
+          MAE(test_schools$n_schools, test_schools$pred_poisson),
+          MAE(test_schools$n_schools, test_schools$pred_quasip),
+          MAE(test_schools$n_schools, test_schools$pred_negbin),
+          MAE(test_schools$n_schools, test_schools$pred_zip),
+          MAE(test_schools$n_schools, test_schools$pred_zinb)),
+    RMSE = c(RMSE(test_schools$n_schools, test_schools$pred_lm),
+          RMSE(test_schools$n_schools, test_schools$pred_poisson),
+          RMSE(test_schools$n_schools, test_schools$pred_quasip),
+          RMSE(test_schools$n_schools, test_schools$pred_negbin),
+          RMSE(test_schools$n_schools, test_schools$pred_zip),
+          RMSE(test_schools$n_schools, test_schools$pred_zinb)),
+    R2 = c(R2(test_schools$n_schools, test_schools$pred_lm),
+          R2(test_schools$n_schools, test_schools$pred_poisson),
+          R2(test_schools$n_schools, test_schools$pred_quasip),
+          R2(test_schools$n_schools, test_schools$pred_negbin),
+          R2(test_schools$n_schools, test_schools$pred_zip),
+          R2(test_schools$n_schools, test_schools$pred_zinb)))
+```
+
+Negative binomial seems to be better than Poisson and QuasiPoisson, by the slightest of the margins. Although it has a slightly higher MAE, its R-squared is better by a more "decisive" amount than the difference in MAE, and its AIC was better than the Poisson. Furthermore, my choice makes sense, because, as anticipated `n_schools` was the one where overdispersion was the most likely to be a problem. 
+<br><br>
+
+## Transport Salespoints
+
+```{r}
+set.seed(12345)
+
+# Linear model 
+lm_transport <- lm(n_transport_salespoints ~ ., data = train_transport)
+
+# Poisson model 
+poisson_transport <- glm(n_transport_salespoints ~ ., data = train_transport, family = "poisson")
+
+# Quasi-Poisson model 
+qpois_transport <- glm(n_transport_salespoints ~ ., data = train_transport, family = "quasipoisson")
+
+# Negative Binomial model
+negbin_transport <- glm.nb(n_transport_salespoints ~ ., data = train_transport)
+
+# Zero-Inflated Poisson model
+zip_transport <- zeroinfl(n_transport_salespoints ~ ., data = train_transport, dist="poisson", link = "logit")
+
+# Zero-Inflated Negative Binomial model
+zinb_transport <- zeroinfl(n_transport_salespoints ~ ., data = train_transport, dist="negbin", link = "logit")
+```
+
+```{r}
+list(linear = AIC(lm_transport),
+     poisson = AIC(poisson_transport),
+     quasi_poisson = AIC(qpois_transport),
+     negative_binomial = AIC(negbin_transport),
+     zero_inflated_poisson = AIC(zip_transport),
+     zero_inflated_negativebinomial = AIC(zinb_transport))
+```
+
+The model with the best AIC in the training data is the Poisson.
+<br><br><br>
+
+```{r}
+test_transport <- test_transport |> 
+  mutate(
+    pred_lm = predict(lm_transport, test_transport, type = "response"),
+    pred_poisson = predict(poisson_transport, test_transport, type = "response"),
+    pred_quasip = predict(qpois_transport, test_transport, type = "response"),
+    pred_negbin = predict(negbin_transport, test_transport, type= "response"),
+    pred_zip = predict(zip_transport, test_transport, type = "response"),
+    pred_zinb = predict(zinb_transport, test_transport, type = "response")
+)
+
+data.frame(
+  model = c("linear", "poisson", "quasi-poisson", "negative-binomial", "zero-inflated-poisson", "zero-inflated-negative-binomial"),
+  MAE = c(MAE(test_transport$n_transport_salespoints, test_transport$pred_lm),
+          MAE(test_transport$n_transport_salespoints, test_transport$pred_poisson),
+          MAE(test_transport$n_transport_salespoints, test_transport$pred_quasip),
+          MAE(test_transport$n_transport_salespoints, test_transport$pred_negbin),
+          MAE(test_transport$n_transport_salespoints, test_transport$pred_zip),
+          MAE(test_transport$n_transport_salespoints, test_transport$pred_zinb)),
+    RMSE = c(RMSE(test_transport$n_transport_salespoints, test_transport$pred_lm),
+          RMSE(test_transport$n_transport_salespoints, test_transport$pred_poisson),
+          RMSE(test_transport$n_transport_salespoints, test_transport$pred_quasip),
+          RMSE(test_transport$n_transport_salespoints, test_transport$pred_negbin),
+          RMSE(test_transport$n_transport_salespoints, test_transport$pred_zip),
+          RMSE(test_transport$n_transport_salespoints, test_transport$pred_zinb)),
+    R2 = c(R2(test_transport$n_transport_salespoints, test_transport$pred_lm),
+          R2(test_transport$n_transport_salespoints, test_transport$pred_poisson),
+          R2(test_transport$n_transport_salespoints, test_transport$pred_quasip),
+          R2(test_transport$n_transport_salespoints, test_transport$pred_negbin),
+          R2(test_transport$n_transport_salespoints, test_transport$pred_zip),
+          R2(test_transport$n_transport_salespoints, test_transport$pred_zinb)))
+```
+
+Zero Inflated Poisson seems to be the best one, it has a slightly higher R2 and a slightly lower mean absolute error, even if its RMSE is a bit higher. Given the high number of zeros present in `n_transport_salespoints` I'll opt for the zero-inflated Poisson.
+<br><br>
+
+# Score generation 
+
+```{r}
+set.seed(123456)
+
+# Train again on the whole dataset
+model_pharmacies <- lm(n_pharmacies ~ ., data = pharmacies)
+model_schools <- glm.nb(n_schools ~ ., data = schools)
+model_transport <- zeroinfl(n_transport_salespoints ~ ., data = transport, dist="poisson", link = "logit")
+
+# Predict
+prediction_pharmacies <- predict(model_pharmacies, pharmacies, type = "response") |>  as.vector()
+prediction_schools <- predict(model_schools, schools, type = "response") |>  as.vector()
+prediction_transport <- predict(model_transport, transport, type = "response") |>  as.vector()
+```
+
+After having selected the best model type for each dependent variables, I train again that model, but now using the whole dataset (training + test). Hopefully, having more training data will yield us better results when using the models to predict our target variables. We will then use these predictions to create a score.
+<br><br><br>
+
+```{r}
+# Generate score
+score <- df |>
+  mutate(score_pharmacies = round(prediction_pharmacies),
+         score_schools = round(prediction_schools),
+         score_transport = round(prediction_transport),
+         lack_facilities = as.factor(case_when(
+           score_pharmacies > n_pharmacies & score_schools > n_schools & score_transport > n_transport_salespoints ~ "Severe",
+           (score_pharmacies > n_pharmacies & score_schools > n_schools & score_transport <= n_transport_salespoints) |
+             (score_pharmacies > n_pharmacies & score_schools <= n_schools & score_transport > n_transport_salespoints) |
+             (score_pharmacies <= n_pharmacies & score_schools > n_schools & score_transport > n_transport_salespoints) ~ "Moderate",
+           (score_pharmacies > n_pharmacies & score_schools <= n_schools & score_transport <= n_transport_salespoints) |
+             (score_pharmacies <= n_pharmacies & score_schools > n_schools & score_transport <= n_transport_salespoints) |
+             (score_pharmacies <= n_pharmacies & score_schools <= n_schools & score_transport > n_transport_salespoints) ~ "Mild",
+           TRUE ~ "No"
+         )),
+         lack_facilities_binary = as.factor(ifelse(lack_facilities %in% c("Severe", "Moderate", "Mild"), "Yes", "No"))) 
+```
+
+I round the predictions of our model to create the supposed number of facilities that our model suggests. If the data shows that the actual number of any of those facilities is below the suggested predicted number of facilities that census section will be considered as lacking facilites.
+<br><br><br>
+
+```{r}
+set.seed(1234567)
+
+# Organize dataframes
+log_df <- score |> 
+  select(-score_pharmacies, -score_schools, -score_transport, -n_pharmacies, -n_schools, -n_transport_salespoints)
+
+log_df_predictors <- log_df |> 
+  select(-lack_facilities, -lack_facilities_binary) |> as.matrix()
+
+log_df_target <- log_df |> 
+  select(lack_facilities_binary) |> as.matrix()
+
+# Apply Lasso regularization to logistic 
+shrinkage_logistic <- cv.glmnet(
+  x = log_df_predictors, y = log_df_target, 
+  lambda = NULL, alpha = 1,
+  type.measure = "auc",
+  standardize = TRUE,
+  nfolds = 10, 
+  family = "binomial")
+
+# Predictions
+pred_prob <- predict(shrinkage_logistic, s = "lambda.min", log_df_predictors, type = "response")
+pred <- predict(shrinkage_logistic, s = "lambda.min", log_df_predictors, type = "class")
+
+# Model results
+confusionMatrix(log_df$lack_facilities_binary, as.factor(pred), positive = "Yes")
+auc(log_df$lack_facilities_binary, factor(pred, ordered = T)) 
+```
+
+After having created my score, I try to predict it through a penalized logistic regression with hyperparameter tuning through 10-fold cross validation. 
+
+Although my model is significant and the AUC of the logistic prediction is >0.5, the AUC it is actually not really high and the model has an accuracy of 0.63, indicating that it is far from being a perfect model.
+<br><br>
+
+# Results analysis and discussion
+
+
+```{r}
+ftable(factor(log_df$lack_facilities, ordered = T, levels = c("No", "Mild", "Moderate", "Severe")), factor(pred, ordered = T))
+```
+We successfully predict all cases of severe facility shortages, indicating that we, at least, can accurately identify areas with the most acute issues. However, we face greater challenges in predicting mild and no categories.
+
+In the case that we are worried of predicting too many areas as "lacking facilities" and we are interested in identifying only those with more severe conditions we should increase the threshold for predicting yes, bringing it above 0.5.
+<br><br><br>
+
+We have previously performed regularization and selected only relevant explanatory variables (from the original dataframe), I now train another logistic model on the whole dataset to see which variables are most important.
+
+```{r}
+# Extract the coefficients at the best lambda
+coefficients <- coef(shrinkage_logistic, s = shrinkage_logistic$lambda.min)
+
+# Identify non-zero coefficients
+non_zero_features <- rownames(coefficients)[which(coefficients != 0)]
+
+# Remove the intercept from the list of features
+non_zero_features <- non_zero_features[non_zero_features != "(Intercept)"]
+
+# Select all those features and scale them
+log_df <- log_df |>
+  select(all_of(non_zero_features), lack_facilities, lack_facilities_binary) |>
+  mutate(across(all_of(non_zero_features), scale)) |> 
+  # Dropping it to handle perfect multicollinearity
+  select(-spanish)
+
+# Train the logistic regression on the whole model using caret
+final_logistic <- glm(lack_facilities_binary ~ ., data = log_df |> select(-lack_facilities), family = binomial)
+
+# View the trained model
+options(scipen = 999)
+summary(final_logistic)
+```
+
+The most statistically significant variables are `population`, `pcg_age_0_24`, `city_population` and `population_density`. `population` and `city_population` have a positive coefficient meaning that higher population implies more likelihood of lacking facilities. `population_density` and `pcg_age_0_24` instead have a negative coefficient thus implying that more densely populated area or areas with a higher population of young people are less likely to lack facilities.
+
+By comparing the magnitude of the coefficients (since our explanatory variables have been scaled), we should be able to detect those that impact the most the likelihood of lacking facilities. And this seems to be again `population` and `city_population`, but also `foreigners` seems to play a role (although its coefficient is not statistically significant).
+
+These variables seem plausible as area with more people need more facilities and thus it might be more probable that the authorities are not able to provide as many facilities as needed for that many people. Furthermore, it is unfortunately true that areas with a higher percentages of foreigners often lack basic facilities.
+
+The fact that some of the most relevant variables (in our final logistic) are coded at a city level, and the fact that (I assume) those facilities are provided by municipalities suggests us that a Poisson GLMM with random and fixed effect with city as the grouping variable, could potentially fit the target variables better and thus could help us improve our score and our predictions of which areas lack facilities.
+
+Lastly, it is worth nothing that although heavy multicollinearity and sometimes perfect multicollinarity was detected among our independent variables, I have not tackled the problem as I was more focused on building a predictive model, but this issue needs to be addressed in the case we aim to build a better explanatory model.
